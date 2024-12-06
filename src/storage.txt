@@ -1,0 +1,1162 @@
+"""
+Notes to self:
+Outline of random notes for potential entropy sol.
+Let H be entropy of remaining squares. That's what we use.
+For a certain square, for all neighbors, check mine/not. so we get 2^neighbors arrangements. Maybe only do this on the min(5,len squares) or smth. Anyway, on arrangement, first check if valid.
+For each arrangement, get corresponding hint number for tile. Do another hatsune_miku assign call. If valid, get entropy and use for weighted entropy.
+
+Entropy is over all squares, including comp random ones. This should actually be optimal. Then I just need utility in terms of info gain vs probability. TODO find. But I will experiment.
+Random square can give any info gain when it has an unc tile in neighbor of neighbors
+"""
+
+from AI import AI
+from Action import Action
+import random
+import itertools
+import time
+import os
+import math
+import logging
+from collections import defaultdict, deque
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logging.disable()
+
+
+class DSU:
+    """
+    Helper Disjoint Union class for general elements
+    """
+
+    def __init__(self):
+        self.parent = {}
+        self.size = {}
+
+    def find(self, x):
+        if self.parent.get(x, x) != x:
+            self.parent[x] = self.find(self.parent[x])
+        return self.parent.get(x, x)
+
+    def union(self, x, y):
+        root_x = self.find(x)
+        root_y = self.find(y)
+
+        if root_x != root_y:
+            self.size.setdefault(root_x, 1)
+            self.size.setdefault(root_y, 1)
+            if self.size[root_x] < self.size[root_y]:
+                self.parent[root_x] = root_y
+            elif self.size[root_y] < self.size[root_x]:
+                self.parent[root_y] = root_x
+            else:
+                self.parent[root_y] = root_x
+                self.size[root_x] += 1
+
+
+# Initialize stats files
+# game_count contains current game count
+# start_time contains the start time of the first world in the current run
+# Initialize them all to be empty
+GAME_COUNT = "game_count.txt"
+START_TIME = "start_time.txt"
+
+if os.path.exists(GAME_COUNT):
+    with open(GAME_COUNT, "w") as f:
+        f.write("")
+
+if os.path.exists(START_TIME):
+    with open(START_TIME, "w") as f:
+        f.write("")
+
+
+class MyAI(AI):
+    def __init__(self, rowDimension, colDimension, totalMines, startX, startY):
+        """
+        self.board represents the hint value state of every tile.
+        -1 means covered, and > -1 means the hint value of the tile(it has been uncovered).
+
+        self.flag represents the flag state of every tile.
+        0(False) means not flagged, and 1(True) means flagged.
+
+        self.tounc, self.toflag are queues(well, stacks) of tiles to uncover/flag
+        """
+
+        self.starttime = (
+            time.time()
+        )  # Time current board was started, for 60s timeout limit
+
+        random.seed(0)  # For reproducibility
+        self.lx = startX  # Last move x
+        self.ly = startY  # Last move y
+        self.lf = False  # if last move flag
+        self.mr = totalMines  # Mines remaining on board
+        self.r = colDimension  # Swap rowdim, coldim
+        self.c = rowDimension
+
+        self.free = self.r * self.c  # Number of covered, unflagged tiles remaining
+        self.board = [[-1] * self.c for _ in range(self.r)]
+        self.flag = [[0] * self.c for _ in range(self.r)]
+        self.tounc = []
+        self.toflag = []
+        self.binommemo = {}  # Memo of binom coefficient calculations
+
+        self.MAX_TIME = 60  # Max time per board
+        self.START_WORSE = 45  # Time when you start making less exhaustive searches
+
+        # self.MAX_TIME = 393940
+        # self.START_WORSE = 393939
+
+        # Load from stats files
+        # self.games is the number of games played(including this one), self.t is the time we started the first board
+        if os.path.exists(GAME_COUNT):
+            with open(GAME_COUNT, "r") as f:
+                c = f.read().strip()
+                if c == "":
+                    self.games = 0
+                else:
+                    self.games = int(c)
+        else:
+            self.games = 0
+
+        if os.path.exists(START_TIME):
+            with open(START_TIME, "r") as f:
+                content = f.read().strip()
+                if content == "":
+                    self.t = time.time()
+                else:
+                    self.t = float(content)
+        else:
+            self.t = time.time()
+
+        # Update stats files
+        if self.games == 0:
+            with open(START_TIME, "w") as f:
+                f.write(str(time.time()))
+
+        self.games += 1
+
+        with open(GAME_COUNT, "w") as f:
+            f.write(str(self.games))
+
+        # if self.games % 10 == 0:
+        if True:
+            # Log the total time elapsed at this game
+            elapsed = time.time() - self.t
+            print(f"Game {self.games} started at {'{:.2f}'.format(elapsed)} seconds")
+
+    def clean(self):
+        """
+        Returns an action move from tounc or toflag if it exists
+        """
+        if self.toflag:
+            x, y = self.toflag.pop()
+            self.lx, self.ly = x, y
+            self.lf = True
+            return Action(AI.Action.FLAG, x, y)
+
+        if self.tounc:
+            x, y = self.tounc.pop()
+            self.lx, self.ly = x, y
+            self.lf = False
+            return Action(AI.Action.UNCOVER, x, y)
+
+        return None
+
+    def getAction(self, number: int) -> "Action Object":
+        # Update board from revealed hint number
+        self.free -= 1
+        if self.lf:
+            self.flag[self.lx][self.ly] = 1
+            self.mr -= 1
+        else:
+            self.board[self.lx][self.ly] = number
+
+        # Ending conditions
+        # If no mines remain, uncover every remaining square
+        if self.mr == 0:
+            for i in range(self.r):
+                for j in range(self.c):
+                    if (
+                        self.board[i][j] == -1
+                        and self.flag[i][j] == 0
+                        and (i, j) not in self.tounc
+                    ):
+                        self.tounc.append((i, j))
+        # If only mines remain, flag every remaining square
+        elif self.mr >= self.free:
+            for i in range(self.r):
+                for j in range(self.c):
+                    if (
+                        self.board[i][j] == -1
+                        and self.flag[i][j] == 0
+                        and (i, j) not in self.toflag
+                    ):
+                        self.toflag.append((i, j))
+
+        # Check for a move from the queues
+        c = self.clean()
+        if c:
+            return c
+
+        # Check for any 100% safe moves using trivial logic
+        for i in range(self.r):
+            for j in range(self.c):
+                if not self.flag[i][j]:
+                    b = self.board[i][j]
+                    if b != -1:
+                        f, o = self.count(i, j)
+                        if o > 0:
+                            if o + f <= b:
+                                for a, b in self.unexplored(i, j):
+                                    if (a, b) not in self.toflag:
+                                        self.toflag.append((a, b))
+                            elif f >= b:
+                                for a, b in self.unexplored(i, j):
+                                    if (a, b) not in self.tounc:
+                                        self.tounc.append((a, b))
+
+        """
+        DUDECHRIS PATTERNS BABY
+        """
+        c = self.clean()
+        if c:
+            return c
+
+
+        def getNeighbors(x: int, y: int) -> list:
+            neighbors = []
+            for dx, dy in [
+                (-1, 1),
+                (0, 1),
+                (1, 1),
+                (-1, 0),
+                (1, 0),
+                (-1, -1),
+                (0, -1),
+                (1, -1),
+            ]:
+                if 0 <= x + dx < self.r and 0 <= y + dy < self.c:
+                    neighbors.append((x + dx, y + dy))
+            return neighbors
+
+
+        def getUnvisitedNeighbors(neighbors: list) -> list:
+            return [n for n in neighbors if unvisited(*n)]
+
+
+        def unvisited(x: int, y: int) -> bool:
+            return self.board[x][y] < 0 and self.flag[x][y] == 0
+
+
+        def countFlagged(neighbors: list) -> int:
+            return sum(self.flag[x][y] for (x, y) in neighbors)
+
+
+        def updateRealHintsTable(x: int, y: int):
+            neighborsA = getNeighbors(x, y)
+            if self.board[x][y] == 0:
+                self.realHints[(x, y)] = 0
+            elif self.board[x][y] > 0:
+                self.realHints[(x, y)] = self.board[x][y] - countFlagged(neighborsA)
+            for (x, y) in neighborsA:
+                if self.board[x][y] == 0:
+                    self.realHints[(x, y)] = 0
+                elif self.board[x][y] > 0:
+                    neighborsB = getNeighbors(x, y)
+                    self.realHints[(x, y)] = self.board[x][y] - countFlagged(neighborsB)
+
+
+        def placeFlag(x: int, y: int):
+            if self.flag[x][y] == 0 and (x, y) not in self.toflag:
+                # self.flag[x][y] = 1
+                # self.mr -= 1
+                self.toflag.append((x, y))
+            if (x, y) in self.tounc:
+                self.tounc.remove((x, y))
+            # neighbors = getNeighbors(x, y)
+            # for (x, y) in neighbors:
+            # 	if b in self.visited and b not in self.tounc:
+            # 		self.tounc.append(b)
+            updateRealHintsTable(x, y)
+
+
+        self.xMax = self.r - 1
+        self.yMax = self.c - 1
+        # def makeRealHintsTable():
+        self.realHints = {}
+        for x in range(self.r):
+            for y in range(self.c):
+                if self.board[x][y] == 0:
+                    self.realHints[(x, y)] = 0
+                elif self.board[x][y] > 0:
+                    neighbors = getNeighbors(x, y)
+                    self.realHints[(x, y)] = self.board[x][y] - countFlagged(neighbors)
+
+        # def findPatterns() -> bool:
+        found = False
+        # def pattern_1_2_1() -> bool:
+        def pattern_1_2_1_h(box: list) -> bool:
+            if all(unvisited(*b) and b not in self.tounc for b in box):
+                # print(f"1-2-1 found {box[0]} mine")
+                placeFlag(*box[0])
+                # print(f"1-2-1 found {box[2]} mine")
+                placeFlag(*box[2])
+                return True
+
+
+        for (x, y) in self.realHints.keys():
+            realHintM = self.realHints[(x, y)]
+            l, d, u, r = (x - 1, y), (x, y - 1), (x, y + 1), (x + 1, y)
+            if (
+                realHintM == 2
+                and sum(
+                    1 for h in [l, d, u, r] if h in self.realHints and self.realHints[h] == 1
+                )
+                == 2
+            ):
+                realHintL = self.realHints[l] if l in self.realHints else -1
+                realHintD = self.realHints[d] if d in self.realHints else -1
+                realHintU = self.realHints[u] if u in self.realHints else -1
+                realHintR = self.realHints[r] if r in self.realHints else -1
+                ld, lu, rd, ru = (x - 1, y - 1), (x - 1, y + 1), (x + 1, y - 1), (x + 1, y + 1)
+                if realHintL == 1 and realHintR == 1:  # left/right to search up/down
+                    if y < self.yMax and (
+                        y == 0
+                        or all(
+                            self.board[ax][ay] >= 0 or self.flag[ax][ay] == 1
+                            for (ax, ay) in [ld, d, rd]
+                        )
+                    ):  # check up
+                        temp = pattern_1_2_1_h([lu, u, ru])
+                        if not found:
+                            found = temp
+                    if y > 0 and (
+                        y == self.yMax
+                        or all(
+                            self.board[ax][ay] >= 0 or self.flag[ax][ay] == 1
+                            for (ax, ay) in [lu, u, ru]
+                        )
+                    ):  # check down
+                        temp = pattern_1_2_1_h([ld, d, rd])
+                        if not found:
+                            found = temp
+                if realHintD == 1 and realHintU == 1:
+                    if x < self.xMax and (
+                        x == 0
+                        or all(
+                            self.board[ax][ay] >= 0 or self.flag[ax][ay] == 1
+                            for (ax, ay) in [ld, l, lu]
+                        )
+                    ):  # check right
+                        temp = pattern_1_2_1_h([rd, r, ru])
+                        if not found:
+                            found = temp
+                    if x > 0 and (
+                        x == self.xMax
+                        or all(
+                            self.board[ax][ay] >= 0 or self.flag[ax][ay] == 1
+                            for (ax, ay) in [rd, r, ru]
+                        )
+                    ):  # check left
+                        temp = pattern_1_2_1_h([ld, l, lu])
+                        if not found:
+                            found = temp
+
+        # def pattern_1_2_2_1() -> bool:
+        def pattern_1_2_2_1_h(box: list) -> bool:
+            if all(unvisited(*b) and b not in self.tounc for b in box):
+                # print(f"1-2-2-1 found {box[1]} mine")
+                placeFlag(*box[1])
+                # print(f"1-2-2-1 found {box[2]} mine")
+                placeFlag(*box[2])
+                return True
+
+
+        for (x, y) in self.realHints.keys():
+            realHintM = self.realHints[(x, y)]
+            l, d, u, r = (x - 1, y), (x, y - 1), (x, y + 1), (x + 1, y)
+            ll, dd, uu, rr = (x - 2, y), (x, y - 2), (x, y + 2), (x + 2, y)
+            if realHintM == 2:
+                realHintL = self.realHints[l] if l in self.realHints else -1
+                realHintD = self.realHints[d] if d in self.realHints else -1
+                realHintU = self.realHints[u] if u in self.realHints else -1
+                realHintUU = self.realHints[uu] if uu in self.realHints else -1
+                realHintR = self.realHints[r] if r in self.realHints else -1
+                realHintRR = self.realHints[rr] if rr in self.realHints else -1
+                ld, lu, rd, ru = (x - 1, y - 1), (x - 1, y + 1), (x + 1, y - 1), (x + 1, y + 1)
+                llu, lld, ldd, luu = (
+                    (x - 2, y + 1),
+                    (x - 2, y - 1),
+                    (x - 1, y - 2),
+                    (x - 1, y + 2),
+                )
+                rdd, ruu, rru, rrd = (
+                    (x + 1, y - 2),
+                    (x + 1, y + 2),
+                    (x + 2, y + 1),
+                    (x + 2, y - 1),
+                )
+                if (
+                    realHintL == 1 and realHintR == 2 and realHintRR == 1
+                ):  # left/right to search up/down
+                    if y < self.yMax and (
+                        y == 0
+                        or all(
+                            self.board[ax][ay] >= 0 or self.flag[ax][ay] == 1
+                            for (ax, ay) in [ld, d, rd, rrd]
+                        )
+                    ):  # check up
+                        temp = pattern_1_2_2_1_h([lu, u, ru, rru])
+                        if not found:
+                            found = temp
+                    if y > 0 and (
+                        y == self.yMax
+                        or all(
+                            self.board[ax][ay] >= 0 or self.flag[ax][ay] == 1
+                            for (ax, ay) in [lu, u, ru, rru]
+                        )
+                    ):  # check down
+                        temp = pattern_1_2_2_1_h([ld, d, rd, rrd])
+                        if not found:
+                            found = temp
+                if (
+                    realHintD == 1 and realHintU == 2 and realHintUU == 1
+                ):  # up/down to search left/right
+                    if x < self.xMax and (
+                        x == 0
+                        or all(
+                            self.board[ax][ay] >= 0 or self.flag[ax][ay] == 1
+                            for (ax, ay) in [ld, l, lu, luu]
+                        )
+                    ):  # check right
+                        temp = pattern_1_2_2_1_h([rd, r, ru, ruu])
+                        if not found:
+                            found = temp
+                    if x > 0 and (
+                        x == self.xMax
+                        or all(
+                            self.board[ax][ay] >= 0 or self.flag[ax][ay] == 1
+                            for (ax, ay) in [rd, r, ru, ruu]
+                        )
+                    ):  # check left
+                        temp = pattern_1_2_2_1_h([ld, l, lu, luu])
+                        if not found:
+                            found = temp
+
+        # def hole_1() -> bool:
+        for a in self.realHints.keys():
+            realHintA = self.realHints[a]
+            if realHintA > 0:
+                neighborsA = getNeighbors(*a)
+                for b in neighborsA:
+                    if b in self.realHints:
+                        realHintA = self.realHints[a]
+                        realHintB = self.realHints[b]
+                        if realHintB > 0:
+                            neighborsB = self.getNeighbors(*b)
+                            unvisitedNeighborsA = set(self.getUnvisitedNeighbors(neighborsA))
+                            unvisitedNeighborsB = set(self.getUnvisitedNeighbors(neighborsB))
+                            unvisitedNeighborsBmA = unvisitedNeighborsB - unvisitedNeighborsA
+                            if (
+                                unvisitedNeighborsBmA
+                                and unvisitedNeighborsA <= unvisitedNeighborsB
+                            ):
+                                if realHintB == realHintA:
+                                    for c in unvisitedNeighborsBmA:
+                                        if c not in self.tounc:
+                                            # # print(f"hole 1 found {c} safe")
+                                            self.tounc.append(c)
+                                            found = True
+                                elif realHintB == realHintA + len(unvisitedNeighborsBmA):
+                                    for c in unvisitedNeighborsBmA:
+                                        # # print(f"hole 1 found {c} mine")
+                                        placeFlag(*c)
+                                        found = True
+                                    unvisitedNeighborsAmB = (
+                                        unvisitedNeighborsA - unvisitedNeighborsB
+                                    )
+                                    for c in unvisitedNeighborsAmB:
+                                        if c not in self.tounc:
+                                            # # print(f"hole 1 found {c} safe")
+                                            self.tounc.append(c)
+                                            found = True
+        # def hole_3() -> bool:
+        for a in self.realHints.keys():
+            realHintA = self.realHints[a]
+            if realHintA > 0:
+                neighborsA = getNeighbors(*a)
+                unvisitedNeighborsA = set(getUnvisitedNeighbors(neighborsA))
+                for (bx, by) in unvisitedNeighborsA:
+                    neighborsB = getNeighbors(bx, by)
+                    for c in neighborsB:
+                        if c in self.realHints:
+                            realHintA = self.realHints[a]
+                            realHintC = self.realHints[c]
+                            if realHintC > 0:
+                                neighborsC = getNeighbors(*c)
+                                unvisitedNeighborsC = set(getUnvisitedNeighbors(neighborsC))
+                                unvisitedNeighborsCmA = (
+                                    unvisitedNeighborsC - unvisitedNeighborsA
+                                )
+                                if (
+                                    unvisitedNeighborsCmA
+                                    and unvisitedNeighborsA <= unvisitedNeighborsC
+                                ):
+                                    if realHintC == realHintA:
+                                        for d in unvisitedNeighborsCmA:
+                                            if d not in self.tounc:
+                                                # # print(f"hole 3 found {d} safe")
+                                                self.tounc.append(d)
+                                                found = True
+                                    elif realHintC == realHintA + len(unvisitedNeighborsCmA):
+                                        # unvisitedNeighborsAmC = unvisitedNeighborsA - unvisitedNeighborsC
+                                        for c in unvisitedNeighborsCmA:
+                                            # # print(f"hole 3 found {c} mine")
+                                            placeFlag(*c)
+                                            found = True
+        """
+        DUDECHRIS OUT
+        """
+
+
+        # See if a 100% safe move was found
+        c = self.clean()
+        if c:
+            return c
+
+        # If no move found, we resort to probability
+        logging.info("No trivial moves found. Using probability... miku time :)")
+        self.hatsune_miku()
+        # self.kasane_teto()
+        logging.info("Probability finished.")
+        c = self.clean()
+        if c:
+            logging.info("Probability found a move... miku sucess B)")
+            return c
+
+        logging.info("No move found from probability")
+
+        # If no move found from probability, it means we are expected to choose a tile not part of any frontier(i.e. has no uncovered neighbors).
+        # If we can't, then choose completely randomly. I can't think of a scenario where this would happen, but... I need that error checking.
+        cand_rand = []
+        cand_completely_rand = []
+        for i in range(self.r):
+            for j in range(self.c):
+                if self.board[i][j] == -1 and self.flag[i][j] == 0:
+                    cand_rand.append((i, j))
+                    neighs = self.neighbors(i, j)
+                    failed = False
+                    for (x, y) in neighs:
+                        if self.board[x][y] >= 0:
+                            failed = True
+                            break
+                    if not failed:
+                        cand_completely_rand.append((i, j))
+        if not cand_rand:
+            logging.info("No moves remain. Leaving...")
+            return Action(AI.Action.LEAVE)
+        if not cand_completely_rand:
+            self.lx, self.ly = random.choice(cand_rand)
+        else:
+            self.lx, self.ly = random.choice(cand_completely_rand)
+        self.lf = False
+        return Action(AI.Action.UNCOVER, self.lx, self.ly)
+
+    def status(self, i, j):
+        """
+        Returns what to do for a tile (i,j) in assign given current board state.
+        -2 means something is wrong and we have created a wrong arrangement
+        -1 means we can't do anything for sure
+        0 means uncover all neighbor cells
+        1 means flag all neighbor cells
+
+        Utilizes essentially same logic as in the trivial part. We are guaranteed that this tile has some covered neighbor.
+        """
+
+        b = self.board[i][j]
+        if b != -1:
+            f, o = self.count(i, j)
+
+            neighs = self.neighbors(i, j)
+            for (x, y) in neighs:
+                if self.flag[x][y] == -1:
+                    o -= 1
+            if f > b:
+                return -2
+            if o + f < b:
+                return -2
+            if o > 0:
+                if o + f == b:
+                    return 1
+                elif f == b:
+                    return 0
+
+        return -1
+
+    def count(self, i, j):
+        """
+        Returns a tuple (f,o) containing the number of flags, and the number of covered and unflagged, neighboring a tile (i,j).
+        """
+        a = max(0, i - 1)
+        b = max(0, j - 1)
+        c = min(self.r, i + 2)
+        d = min(self.c, j + 2)
+        f = 0
+        o = 0
+        for x in range(a, c):
+            for y in range(b, d):
+                if (x, y) != (i, j):
+                    if self.flag[x][y] == 1:
+                        f += 1
+                    elif self.board[x][y] == -1:
+                        o += 1
+        return (f, o)
+
+    def neighbors(self, i, j):
+        """
+        Returns a list of all neighbors of a tile (i,j)
+        """
+        a = max(0, i - 1)
+        b = max(0, j - 1)
+        c = min(self.r, i + 2)
+        d = min(self.c, j + 2)
+        aa = []
+        for x in range(a, c):
+            for y in range(b, d):
+                if (x, y) != (i, j):
+                    aa.append((x, y))
+        return aa
+
+    def unexplored(self, i, j):
+        """
+        Returns a list of all covered, unflagged tiles neighboring (i,j)
+        """
+        a = max(0, i - 1)
+        b = max(0, j - 1)
+        c = min(self.r, i + 2)
+        d = min(self.c, j + 2)
+        ans = []
+        for x in range(a, c):
+            for y in range(b, d):
+                if (x, y) != (i, j) and self.flag[x][y] == 0 and self.board[x][y] == -1:
+                    ans.append((x, y))
+        return ans
+
+    def hatsune_miku(self, entropy=False):
+        """
+        Hatsune Miku sez... probability!
+        This is the core probability solver. It works by:
+        1) generating all possible mine arrangements on the frontier through backtracking
+        2) Store the arrangements in a hashmap using total mine count per arrangement
+        3) Add the multiplier from random cells into arrangements
+        4) Use these statistics to get the absolute probability each tile is a mine
+        5) Choose the square with lowest mine probability to uncover.
+        TODO choose square with highest mine probability to unflag, and build complete unflagging/resolve mechanism if we get to contradiction in board. (flags are reversible)
+        TODO add info gain, see note at top
+        """
+
+        # Split all board squares into frontiers
+        # Group them by DSU
+        self.vis = set()
+        dsu = DSU()
+        frontiers = []
+        for x in range(self.r):
+            for y in range(self.c):
+                if self.board[x][y] == -1 and self.flag[x][y] == 0:
+                    neighs = self.neighbors(x, y)
+                    added = False
+                    for (i, j) in neighs:
+                        if self.board[i][j] >= 0 and self.flag[i][j] == 0:
+                            neighs2 = self.neighbors(i, j)
+                            for (p, q) in neighs2:
+                                if self.board[p][q] == -1 and self.flag[p][q] == 0:
+                                    dsu.union((x, y), (i, j))
+                            if not added:
+                                frontiers.append((x, y))
+                                added = True
+
+        # Utilize DSU structure to build list of frontiers
+        frontierMap = defaultdict(list)
+        for f in frontiers:
+            frontierMap[dsu.find(f)].append(f)
+        frontiers = list(frontierMap.values())
+
+        """
+        map holds the results from assigning. The structure is as follows:
+
+        map[i] holds the results for the ith frontier. Each result is a tuple containing two dictionaries, mc and tc.
+
+        mc is a dictionary which maps mine count to an array. What this means is, over all arrangements on the frontier
+        with mine count equal to x, how many of those have tile i being a mine? This is stored in mc[x][i].
+
+        tc is similar, in that it maps mine count to an array. However, this stores, for all arrangements on the frontier
+        with mine count equal to x, how many total arrangements are there involving tile i? This is stored in tc[x][i].
+
+        Technically all entries for a specific tc[x] should be the exact same(an arrangement uses all tiles on the frontier),
+        but it's easier to implement this way.
+        """
+        map = [None for _ in range(len(frontiers))]
+        for i, frontier in enumerate(frontiers):
+            # Get topological sorting of cells for the specific frontier
+            # The topological sort is the order we will assign the cells in
+            # topo = self.toposort(frontier[0][0],frontier[0][1])
+            self.mc = defaultdict(lambda: [0] * len(frontier))
+            self.tc = defaultdict(lambda: [0] * len(frontier))
+            self.fcassignments = defaultdict(int)  # Maps fc to # assignments
+            self.assign(frontier)  # Do the assignment into self.mc, self.tc
+            map[i] = (self.mc, self.tc, self.fcassignments)
+
+        # Get tile probabilities out of results
+        # probs is a list of probabilities for each tile, and randp is the probability of an isolated tile
+        probs, randp = self.prob(frontiers, map)
+        if not probs:
+            return None
+        if entropy:
+            return probs, randp, frontiers, map
+
+        found = False
+        for t in list(probs.keys()):
+            # Look for "guaranteed" moves that have probability of being wrong below 0.001
+            p = probs[t]
+            if p <= 0.001:
+                found = True
+                self.tounc.append(t)
+            elif p >= 0.999:
+                found = True
+                self.toflag.append(t)
+
+        if found:
+            logging.info("Choosing guaranteed tile.")
+            return
+
+        # If we haven't found any guaranteed moves, we need to uncover tile with lowest probability, or choose randomly if an isolated tile has lower probability
+        logging.info("No guaranteed tiles found. Guessing.")
+        cringe = [
+            (t, probs[t]) for t in list(probs.keys())
+        ]  # in the future, I might try to do some entropy logic, so instead of just taking the min I am making a sorted list
+        cringe.sort(key=lambda x: x[1])
+        pos = []
+        if randp >= cringe[0][1]:
+            # self.tounc.append(cringe[0][0])
+            # return
+            best = cringe[0][1]
+            idx = 0
+            while idx < len(cringe) and cringe[idx][1] <= best:  # Maybe change
+                pos.append(cringe[idx][0])
+                idx += 1
+        else:
+            return
+            # pos = self.choose_random()
+        best = 99999
+        bestt = None
+        for t in pos:
+            # cnt = self.entropy_unc(t)
+            cnt = -1 * self.calculate_trivial(t[0], t[1])
+            # cnt = random.choice(list(range(1,10000)))
+            # print(f"{t,probs[t],cnt}")
+            if best == 99999 or cnt < best:
+                best = cnt
+                bestt = t
+
+        # time.sleep(1000)
+        self.tounc.append(bestt)
+
+    def far2(self, x, y):
+        if self.board[x][y] == -1:
+            neighs = self.neighbors(x, y)
+            for nx, ny in neighs:
+                if self.board[nx][ny] >= 0:
+                    return False
+
+            for nx, ny in neighs:
+                neighs2 = self.neighbors(nx, ny)
+                for n2x, n2y in neighs2:
+                    if self.board[n2x][n2y] >= 0:
+                        return True
+        return False
+
+    def choose_random(self):
+        """
+        Comes up with a list of squares that are within 2 blocks of frontier
+        """
+        res = []
+        for x in range(self.r):
+            for y in range(self.c):
+                if self.far2(x, y):
+                    res.append((x, y))
+        # print(res)
+        # time.sleep(100000)
+        # return random.choice(res)
+        return res
+
+    def calculate_trivial(self, x, y):
+        """
+        Gets # of trivial moves if (x,y) is set
+        Basically does BFS out, and using board as intermediate state, -2=unc, -3=flag
+
+        100 expert:
+        43->47
+        48->48
+
+        tournament:
+        ->907,879,486
+        """
+        self.board[x][y] = -2  # Change to iter 0..8 with prob
+        neighs = self.neighbors(x, y)
+        queue = deque()
+        for nx, ny in neighs:
+            if self.board[nx][ny] >= 0:
+                neighs2 = self.neighbors(nx, ny)
+                for n2x, n2y in neighs2:
+                    queue.append((n2x, n2y))
+        # queue=deque(initneighs)
+        vis = set()
+        cnt = 0
+        while len(queue) > 0:
+            qx, qy = queue.popleft()
+            if self.board[qx][qy] != -1 or self.flag[qx][qy] == 1 or (qx, y) in vis:
+                continue
+            neighs = self.neighbors(qx, qy)
+
+            bit = 0
+            totaln2 = []
+            for nx, ny in neighs:
+                if self.board[nx][ny] >= 0:
+                    neighs2 = self.neighbors(nx, ny)
+                    f, o = 0, 0
+                    for n2x, n2y in neighs2:
+                        if self.flag[n2x][n2y] == 1 or self.board[n2x][n2y] == -3:
+                            f += 1
+                        elif self.flag[n2x][n2y] == 0 and self.board[n2x][n2y] == -1:
+                            o += 1
+                            totaln2.append((n2x, n2y))
+                    if o + f == self.board[nx][ny]:
+                        bit |= 2
+                    elif f == self.board[nx][ny]:
+                        bit |= 1
+                    if bit == 3:
+                        break
+            if bit == 3:
+                break
+            if bit == 1 or bit == 2:
+                if bit == 1:
+                    self.board[qx][qy] = -2
+                elif bit == 2:
+                    self.board[qx][qy] = -3
+                cnt += 1
+                vis.add((qx, qy))
+                for n in totaln2:
+                    if n not in vis:
+                        queue.append(n)
+        self.board[x][y] = -1
+        for vx, vy in vis:
+            if self.board[vx][vy] == -2 or self.board[vx][vy] == -3:
+                self.board[vx][vy] = -1
+        return cnt
+
+    def future(self, x, y):
+        """
+        Get all neighbors of neighbors of a tile (x,y), through an uncovered square.
+        This is all the tiles we would locally affect if we uncovered/flagged a particular tile (x,y).
+        Used in toposort
+        """
+        neighs = self.neighbors(x, y)
+        real = set()
+        for (i, j) in neighs:
+            if self.board[i][j] >= 0:
+                neighs2 = self.neighbors(i, j)
+                for (p, q) in neighs2:
+                    if (
+                        (p, q) != (x, y)
+                        and self.board[p][q] == -1
+                        and self.flag[p][q] == 0
+                    ):
+                        real.add((p, q))
+        return list(real)
+
+    def toposort(self, x, y):
+        """
+        Toposort a specific frontier from (x,y) start
+        """
+        self.res = []
+        self.vis = set()
+        self._t_dfs(x, y)
+        return self.res
+
+    def _t_dfs(self, x, y):
+        """
+        Recursively toposort using the edge list built from future
+        """
+
+        if (
+            x < 0
+            or x >= self.r
+            or y < 0
+            or y >= self.c
+            or self.board[x][y] >= 0
+            or self.flag[x][y] != 0
+            or (x, y) in self.vis
+        ):
+            return  # Out of bounds
+        self.res.append((x, y))
+        self.vis.add((x, y))
+        f = self.future(x, y)
+        for neigh in f:
+            if neigh not in self.vis:
+                self._t_dfs(neigh[0], neigh[1])
+
+    def assign(self, frontier):
+        """
+        Generate all mine assignments for a frontier, sorted by the topological sorting
+        """
+        self.currentf = frontier
+        self.numassignments = 0  # Total number of assignments found
+        self._assign(0, 0)
+
+    def _assign(self, i, fc):
+        """
+        Recursive function to generate assignments, using self.board as intermediate state
+        i=idx in frontier list, fc=flag count so far
+        We use self.flag[x][y]==-1 as an intermediate state to represent "uncovered in the current arrangement"
+        """
+
+        if i == len(self.currentf):
+            # We have found a complete arrangement! Update mc,tc counts
+            mines = []
+            safe = []
+            for ti, tile in enumerate(self.currentf):
+                if self.flag[tile[0]][tile[1]] == 1:
+                    self.mc[fc][ti] += 1
+                self.tc[fc][ti] += 1
+            self.numassignments += 1
+            self.fcassignments[fc] += 1
+            return
+        cur = self.currentf[i]
+        neighs = self.neighbors(cur[0], cur[1])
+        bit = 0  # bit is a 2-bit integer, lsb holds if we should uncover all and msb holds if we should flag all
+
+        # Check status of all neighbors
+        for (x, y) in neighs:
+            s = self.status(x, y)
+            if s == 0:
+                bit |= 1
+            elif s == 1:
+                bit |= 2
+            if bit == 3:
+                break
+            elif s == -2:
+                return  # The arrangement is bad
+
+        if bit == 3:
+            return  # Contradiction, can't both flag and uncover
+
+        if bit == 2:
+            # One of the neighbors has a "flag all" condition, so we must be flagged
+            self.flag[cur[0]][cur[1]] = 1
+            self._assign(i + 1, fc + 1)
+        elif bit == 1:
+            # One of the neighbors has an "uncover all" condition, so we must be uncovered
+            self.flag[cur[0]][cur[1]] = -1
+            self._assign(i + 1, fc)
+        else:
+            # Otherwise, we need to try both
+            # However if we are close to time limit we sometimes don't want to do both for time reasons
+            dual = True
+            rem = time.time() - self.starttime
+            if rem > self.MAX_TIME:
+                dual = False  # If past time limit just give up
+            elif (
+                rem > self.START_WORSE and len(self.currentf) > 20
+            ):  # 45.01 for prob 1, shouldn't matter much
+                """
+                These are hardcoded, hand-determined constants.
+                Essentially, this checks if we are in a very large frontier. The rational is that if we aren't, doing the full exponential search
+                shouldn't take too long, so even though we're close to time limit, we can afford to do it and be 100% correct. Starts doing less and less
+                exponential work as the number of assignments grows. However we use randoms all over the place so that SOMETIMES we will do both on certain tiles.
+                Hopefully this should give better overall performance, though I haven't tested it.
+                """
+                prob = (
+                    1
+                    - ((rem - self.START_WORSE) / (self.MAX_TIME - self.START_WORSE))
+                    ** 2
+                )  # The 2 can be changed, desmos says this is alr
+                dual = random.random() < prob
+
+            if not dual:
+                # If not doing both, choose randomly whether to try flagging/unflagging
+                self.flag[cur[0]][cur[1]] = random.choice(
+                    [-1, -1, 1]
+                )  # Prioritize unflagging, idk exact number but # flags on frontier is small
+                self._assign(i + 1, fc + int(self.flag[cur[0]][cur[1]] == 1))
+            else:
+                # If doing both, do one, backtrack, try the other
+                self.flag[cur[0]][cur[1]] = -1
+                self._assign(i + 1, fc)
+                self.flag[cur[0]][cur[1]] = 1
+                self._assign(i + 1, fc + 1)
+
+        self.flag[cur[0]][cur[1]] = 0  # Reset tile
+
+    def binom(self, a, b):
+        """
+        Computes a choose b
+        Stores the result in a memo dictionary, because there should be a lot
+        of repeated requests, and we are working with large numbers, so inefficient
+        to redo over and over again.
+        """
+        if a == b or b == 0:
+            return 1
+        if b > a or b < 0:
+            return 0
+
+        if (a, b) in self.binommemo:
+            return self.binommemo[(a, b)]
+        self.binommemo[(a, b)] = math.factorial(a) / (
+            math.factorial(b) * math.factorial(a - b)
+        )  # a choose b = a!/(b!x(a-b)!). could be optimized slightly but it is not at all a concern
+        return self.binommemo[(a, b)]
+
+    def prob(self, frontiers, map):
+        """
+        Uses the assignments provided in the map to get the probability of all tiles
+        Note that rmine,rtotal are different than just summing over map due to the distribution of remaining flags across isolated tiles
+        We also discard all assignments which use more mines than there are remaining(technically, this should be done in _assign, but it happens only in endgame where frontiers are very small, so doesn't matter)
+        """
+        rmine = defaultdict(
+            lambda: defaultdict(int)
+        )  # Used to hold the total num of arrangements where a tile is a mine.
+        rtotal = defaultdict(
+            lambda: defaultdict(int)
+        )  # Used to hold the total num of arrangements involving a tile. Again, like in map, should be same across all tiles.
+        randm = 0  # Same thing, but for isolated tiles. They're all the same probability/stats (minus info gain), so no point shoving them in rmine/rtotal.
+        randt = 0  # Also same, but for isolated tiles.
+        flag_counts = [
+            list(m[1].keys()) for m in map
+        ]  # Stores a list of all flag counts, for each frontier
+
+        """
+        I don't believe there is any neat mathy way to do this besides generating all possible combinations.
+        There are usually like 4 frontiers max across a game when calling probability, so this isn't really that bad.
+        4^(around 4)=256 max which is completely negligible
+        """
+        combs = [
+            list(comb) for comb in list(itertools.product(*flag_counts))
+        ]  # Get all possible combinations of flag counts on the frontier assignments
+        combs.sort(
+            key=lambda x: sum(x)
+        )  # Sort according to the total flag count over all frontiers
+        compfree = self.free - sum(
+            len(f) for f in frontiers
+        )  # Get the number of isolated tiles
+        if compfree < 0:
+            return None, 1  # Something terribly wrong
+
+        # Get the highest mine count possible for a valid assignment. Could be done by bisect but I was lazy.
+        idx = len(combs) - 1
+        while idx >= 0 and sum(combs[idx]) > self.mr:
+            idx -= 1
+        if idx < 0:
+            return None, 1  # No valid arrangements
+        mx = sum(combs[idx])
+        if self.mr - mx > compfree:
+            return None, 1  # No valid arrangements
+
+        # End goal of this is to transform our "per frontier" mine count mapping to a "per total" arrangement mine count mapping
+        for c in combs:
+            sm = sum(c)  # Get total mine count
+            if sm > self.mr:
+                break  # It's sorted by mine count, so all the rest are also invalid
+            mul = self.binom(
+                compfree, self.mr - sm
+            )  # Get the isolated square multiplier
+            numarrang = 1  # Number of arrangements total over the frontiers
+
+            # For all tiles update the "per total" arrangement
+            # Also, calculate isolated square probability using total mines
+            for (fc, m, f) in zip(c, map, frontiers):
+                curm = m[0][fc]
+                curt = m[1][fc]
+                for t, mine, total in zip(f, curm, curt):
+                    rmine[t][sm] += mine
+                    rtotal[t][sm] += total
+                numarrang *= total  # They are independent, multiply number of arrangements for each frontier
+
+            # Update isolated square probabilities
+            randt += mul * numarrang
+            if compfree > 0:
+                randm += (self.mr - sm) / compfree * mul * numarrang
+
+        # For each tile, use the general isolated square multiplier to calculate the true probability of each tile being a mine
+        rprob = {}
+        for f in frontiers:
+            for t in f:
+                tot = 0
+                for fc in list(rtotal[t].keys()):
+                    minec = rmine[t][fc] if fc in rmine[t] else 0
+                    mul = self.binom(compfree, self.mr - fc)
+                    if t in rprob:
+                        rprob[t] += minec / rtotal[t][fc] * mul
+                    else:
+                        rprob[t] = minec / rtotal[t][fc] * mul
+                    tot += mul
+                rprob[t] /= tot
+
+        if compfree > 0:
+            return rprob, randm / randt
+        return (
+            rprob,
+            1,
+        )  # No isolated tiles left to choose from, so definitely don't try uncovering them
+
+    def comb_sum(self, compfree, map):
+        """
+        Helper for entropy_unc
+        """
+        vals = []
+        for m in map:
+            vals.append(list(m[2].keys()))
+        combs = [list(comb) for comb in list(itertools.product(*vals))]
+        ans = 0
+        for c in combs:
+            x = 1
+            fsum = 0
+            for fc, m in zip(c, map):
+                fsum += fc
+                x *= m[2][fc]
+            x *= self.binom(compfree, self.mr - fsum)
+            ans += x
+        return ans
+
+    def entropy_unc(self, tile):
+        """
+        returns not entropy, but a weighted entropy. the more assignments the better
+        """
+        self.free -= 1
+        weighted_entropy = 0
+        total_assignments = 0
+        for x in range(0, 9):
+            self.board[tile[0]][tile[1]] = x
+            try:
+                rprob, randp, new_frontiers, map = self.hatsune_miku(entropy=True)
+            except:
+                continue  # tuple unpack error, hatsune_miku returned none
+            compfree = self.free - sum(len(f) for f in new_frontiers)
+            assignments = self.comb_sum(compfree, map)
+            total_assignments += assignments
+            ent = 0
+            if randp > 0.001 and randp < 0.999:
+                ent -= (
+                    randp * math.log2(randp) + (1 - randp) * math.log2(1 - randp)
+                ) * compfree
+            for p in list(rprob.values()):
+                if p > 0.001 and p < 0.999:
+                    ent -= p * math.log2(p) + (1 - p) * math.log2(1 - p)
+            # print(f"{tile} at value {x} has assignment {assignments} with ent {ent}")
+            weighted_entropy += ent * assignments
+        self.board[tile[0]][tile[1]] = -1
+        self.free += 1
+        if total_assignments == 0:
+            return 1 * (10**9)  # don't pick :c
+        return weighted_entropy / total_assignments
