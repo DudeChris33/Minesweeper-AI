@@ -1,2 +1,3 @@
 Minesweeper AI
-doesnt work here, requires code I didnt publish written by my professor to generate maps and run
+python3 WorldGenerator.py [numFiles] [filename] [rowDimension] [colDimension] [numMines]
+python3 Main.py -f /path/to/world/files/ (-m)
